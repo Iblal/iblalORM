@@ -27,6 +27,30 @@ interface ColumnInfo {
 }
 
 /**
+ * Foreign key relationship metadata
+ */
+interface ForeignKeyInfo {
+  constraint_name: string;
+  source_table: string;
+  source_column: string;
+  target_table: string;
+  target_column: string;
+}
+
+/**
+ * Relationship structure for code generation
+ */
+interface RelationshipInfo {
+  name: string;
+  type: "belongsTo" | "hasMany" | "hasOne";
+  sourceTable: string;
+  sourceColumn: string;
+  targetTable: string;
+  targetColumn: string;
+  targetInterface: string;
+}
+
+/**
  * Parsed table structure for code generation
  */
 interface TableStructure {
@@ -39,6 +63,7 @@ interface TableStructure {
     isNullable: boolean;
     hasDefault: boolean;
   }[];
+  relationships: RelationshipInfo[];
 }
 
 /**
@@ -113,9 +138,33 @@ const INTROSPECTION_QUERY = `
     table_schema = $1
     AND table_name NOT LIKE 'pg_%'
     AND table_name NOT LIKE 'sql_%'
+    AND table_name NOT LIKE '_iblal_%'
   ORDER BY 
     table_name, 
     ordinal_position;
+`;
+
+/**
+ * SQL query to introspect foreign key relationships
+ */
+const FOREIGN_KEYS_QUERY = `
+  SELECT
+    tc.constraint_name,
+    tc.table_name AS source_table,
+    kcu.column_name AS source_column,
+    ccu.table_name AS target_table,
+    ccu.column_name AS target_column
+  FROM
+    information_schema.table_constraints AS tc
+    JOIN information_schema.key_column_usage AS kcu
+      ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+    JOIN information_schema.constraint_column_usage AS ccu
+      ON ccu.constraint_name = tc.constraint_name
+      AND ccu.table_schema = tc.table_schema
+  WHERE
+    tc.constraint_type = 'FOREIGN KEY'
+    AND tc.table_schema = $1;
 `;
 
 /**
@@ -134,6 +183,69 @@ async function introspectSchema(schema: string): Promise<ColumnInfo[]> {
 }
 
 /**
+ * Fetch foreign key relationships from the database
+ */
+async function introspectForeignKeys(
+  schema: string
+): Promise<ForeignKeyInfo[]> {
+  const adapter = getDbAdapter();
+
+  console.log(`🔗 Introspecting relationships...`);
+
+  const result = await adapter.query<ForeignKeyInfo>(FOREIGN_KEYS_QUERY, [
+    schema,
+  ]);
+
+  console.log(`   Found ${result.rows.length} foreign key relationships`);
+
+  return result.rows;
+}
+
+/**
+ * Process foreign keys into relationship definitions
+ */
+function processRelationships(
+  tables: TableStructure[],
+  foreignKeys: ForeignKeyInfo[]
+): void {
+  const tableMap = new Map(tables.map((t) => [t.tableName, t]));
+
+  for (const fk of foreignKeys) {
+    const sourceTable = tableMap.get(fk.source_table);
+    const targetTable = tableMap.get(fk.target_table);
+
+    if (!sourceTable || !targetTable) continue;
+
+    const targetInterfaceName = snakeToPascal(singularize(fk.target_table));
+    const sourceInterfaceName = snakeToPascal(singularize(fk.source_table));
+
+    // Add "belongsTo" relationship on the source table (e.g., Post belongsTo User)
+    const belongsToName = snakeToCamel(singularize(fk.target_table));
+    sourceTable.relationships.push({
+      name: belongsToName,
+      type: "belongsTo",
+      sourceTable: fk.source_table,
+      sourceColumn: fk.source_column,
+      targetTable: fk.target_table,
+      targetColumn: fk.target_column,
+      targetInterface: targetInterfaceName,
+    });
+
+    // Add "hasMany" relationship on the target table (e.g., User hasMany Posts)
+    const hasManyName = snakeToCamel(fk.source_table); // Keep plural
+    targetTable.relationships.push({
+      name: hasManyName,
+      type: "hasMany",
+      sourceTable: fk.target_table,
+      sourceColumn: fk.target_column,
+      targetTable: fk.source_table,
+      targetColumn: fk.source_column,
+      targetInterface: sourceInterfaceName,
+    });
+  }
+}
+
+/**
  * Group columns by table and transform to TypeScript structure
  */
 function processSchemaData(columns: ColumnInfo[]): TableStructure[] {
@@ -144,6 +256,7 @@ function processSchemaData(columns: ColumnInfo[]): TableStructure[] {
       tableMap.set(col.table_name, {
         tableName: col.table_name,
         columns: [],
+        relationships: [],
       });
     }
 
@@ -177,13 +290,28 @@ function generateInterface(table: TableStructure): string {
     })
     .join("\n");
 
+  // Generate relationship properties (optional by default)
+  const relationshipProps = table.relationships
+    .map((rel) => {
+      if (rel.type === "hasMany") {
+        return `  /** Relationship: ${rel.type} ${rel.targetInterface} */\n  ${rel.name}?: ${rel.targetInterface}[];`;
+      } else {
+        return `  /** Relationship: ${rel.type} ${rel.targetInterface} */\n  ${rel.name}?: ${rel.targetInterface};`;
+      }
+    })
+    .join("\n");
+
+  const allProperties = relationshipProps
+    ? `${properties}\n\n  // Relationships\n${relationshipProps}`
+    : properties;
+
   return `/**
  * Generated interface for table: ${table.tableName}
  * 
  * @generated This file is auto-generated. Do not edit manually.
  */
 export interface ${interfaceName} {
-${properties}
+${allProperties}
 }`;
 }
 
@@ -205,6 +333,50 @@ function generateModelsFile(tables: TableStructure[]): string {
 `;
 
   const interfaces = tables.map(generateInterface).join("\n\n");
+
+  // Generate WithRelations types for type-safe .include()
+  const withRelationsTypes = tables
+    .filter((t) => t.relationships.length > 0)
+    .map((t) => {
+      const interfaceName = snakeToPascal(singularize(t.tableName));
+      const relationNames = t.relationships
+        .map((r) => `"${r.name}"`)
+        .join(" | ");
+
+      return `/**
+ * Type helper for ${interfaceName} with loaded relationships
+ */
+export type ${interfaceName}WithRelations<R extends ${relationNames}> = ${interfaceName} & Required<Pick<${interfaceName}, R>>;`;
+    })
+    .join("\n\n");
+
+  // Generate relationship metadata for runtime
+  const relationshipMeta = tables
+    .filter((t) => t.relationships.length > 0)
+    .map((t) => {
+      const interfaceName = snakeToPascal(singularize(t.tableName));
+      const relations = t.relationships
+        .map(
+          (r) =>
+            `    ${r.name}: { type: "${r.type}", targetTable: "${r.targetTable}", sourceColumn: "${r.sourceColumn}", targetColumn: "${r.targetColumn}" }`
+        )
+        .join(",\n");
+      return `  ${interfaceName}: {\n${relations}\n  }`;
+    })
+    .join(",\n");
+
+  const relationshipMetaExport = relationshipMeta
+    ? `
+/**
+ * Relationship metadata for runtime queries
+ */
+export const relationshipMeta = {
+${relationshipMeta}
+} as const;
+
+export type RelationshipMeta = typeof relationshipMeta;
+`
+    : "";
 
   // Generate a type that maps table names to their interfaces
   const tableNameMapping = tables
@@ -230,7 +402,14 @@ export type TableName = keyof TableMap;
 export type TableType<T extends TableName> = TableMap[T];
 `;
 
-  return header + interfaces + tableMapType;
+  return (
+    header +
+    interfaces +
+    "\n\n" +
+    withRelationsTypes +
+    relationshipMetaExport +
+    tableMapType
+  );
 }
 
 /**
@@ -242,10 +421,42 @@ function generateClientFile(tables: TableStructure[]): string {
   );
   const imports = interfaceNames.join(", ");
 
+  // Check if any table has relationships
+  const hasRelationships = tables.some((t) => t.relationships.length > 0);
+  const relationshipMetaImport = hasRelationships ? ", relationshipMeta" : "";
+
+  // Generate auto field types based on actual table columns
   const autoFieldTypes = tables
     .map((t) => {
       const name = snakeToPascal(singularize(t.tableName));
-      return `export type ${name}AutoFields = "id" | "createdAt" | "updatedAt";`;
+      const columnNames = new Set(t.columns.map((c) => c.tsPropertyName));
+
+      // Only include fields that actually exist in the table AND have defaults
+      const autoFields: string[] = [];
+      if (columnNames.has("id")) {
+        const idCol = t.columns.find((c) => c.tsPropertyName === "id");
+        if (idCol?.hasDefault) autoFields.push("id");
+      }
+      if (columnNames.has("createdAt")) {
+        const createdAtCol = t.columns.find(
+          (c) => c.tsPropertyName === "createdAt"
+        );
+        if (createdAtCol?.hasDefault) autoFields.push("createdAt");
+      }
+      if (columnNames.has("updatedAt")) {
+        const updatedAtCol = t.columns.find(
+          (c) => c.tsPropertyName === "updatedAt"
+        );
+        if (updatedAtCol?.hasDefault) autoFields.push("updatedAt");
+      }
+
+      if (autoFields.length === 0) {
+        return `export type ${name}AutoFields = never;`;
+      }
+
+      return `export type ${name}AutoFields = ${autoFields
+        .map((f) => `"${f}"`)
+        .join(" | ")};`;
     })
     .join("\n");
 
@@ -253,9 +464,35 @@ function generateClientFile(tables: TableStructure[]): string {
     .map((t) => {
       const interfaceName = snakeToPascal(singularize(t.tableName));
       const propName = singularize(t.tableName);
+      const columnNames = new Set(t.columns.map((c) => c.tsPropertyName));
+
+      // Build auto-excludes comment based on actual fields
+      const autoFields: string[] = [];
+      if (columnNames.has("id")) {
+        const idCol = t.columns.find((c) => c.tsPropertyName === "id");
+        if (idCol?.hasDefault) autoFields.push("id");
+      }
+      if (columnNames.has("createdAt")) {
+        const createdAtCol = t.columns.find(
+          (c) => c.tsPropertyName === "createdAt"
+        );
+        if (createdAtCol?.hasDefault) autoFields.push("createdAt");
+      }
+      if (columnNames.has("updatedAt")) {
+        const updatedAtCol = t.columns.find(
+          (c) => c.tsPropertyName === "updatedAt"
+        );
+        if (updatedAtCol?.hasDefault) autoFields.push("updatedAt");
+      }
+
+      const autoExcludesComment =
+        autoFields.length > 0
+          ? `Auto-excludes: ${autoFields.join(", ")} from inserts`
+          : "No auto-generated fields";
+
       return `  /**
    * Table accessor for \`${t.tableName}\` table
-   * Auto-excludes: id, createdAt, updatedAt from inserts
+   * ${autoExcludesComment}
    */
   public readonly ${propName}: Table<${interfaceName}, ${interfaceName}AutoFields>;`;
     })
@@ -265,11 +502,46 @@ function generateClientFile(tables: TableStructure[]): string {
     .map((t) => {
       const interfaceName = snakeToPascal(singularize(t.tableName));
       const propName = singularize(t.tableName);
-      return `    this.${propName} = new Table<${interfaceName}, ${interfaceName}AutoFields>("${t.tableName}", [
-      "id",
-      "createdAt",
-      "updatedAt",
-    ]);`;
+      const hasRels = t.relationships.length > 0;
+      const columnNames = new Set(t.columns.map((c) => c.tsPropertyName));
+
+      // Build array of actual auto fields
+      const autoFields: string[] = [];
+      if (columnNames.has("id")) {
+        const idCol = t.columns.find((c) => c.tsPropertyName === "id");
+        if (idCol?.hasDefault) autoFields.push("id");
+      }
+      if (columnNames.has("createdAt")) {
+        const createdAtCol = t.columns.find(
+          (c) => c.tsPropertyName === "createdAt"
+        );
+        if (createdAtCol?.hasDefault) autoFields.push("createdAt");
+      }
+      if (columnNames.has("updatedAt")) {
+        const updatedAtCol = t.columns.find(
+          (c) => c.tsPropertyName === "updatedAt"
+        );
+        if (updatedAtCol?.hasDefault) autoFields.push("updatedAt");
+      }
+
+      const autoFieldsArray =
+        autoFields.length > 0
+          ? `[${autoFields.map((f) => `"${f}"`).join(", ")}]`
+          : "[]";
+
+      if (hasRels) {
+        return `    this.${propName} = new Table<${interfaceName}, ${interfaceName}AutoFields>(
+      "${t.tableName}",
+      ${autoFieldsArray},
+      "${interfaceName}",
+      relationshipMeta.${interfaceName}
+    );`;
+      } else {
+        return `    this.${propName} = new Table<${interfaceName}, ${interfaceName}AutoFields>(
+      "${t.tableName}",
+      ${autoFieldsArray}
+    );`;
+      }
     })
     .join("\n\n");
 
@@ -288,8 +560,10 @@ function generateClientFile(tables: TableStructure[]): string {
 import { Table } from "../src/query/Table";
 import { getDbAdapter, DbAdapter } from "../src/db/DbAdapter";
 
-// Import generated model types
-import { ${imports} } from "./models";
+// Import generated model types${
+    hasRelationships ? " and relationship metadata" : ""
+  }
+import { ${imports}${relationshipMetaImport} } from "./models";
 
 // ============================================================================
 // Auto-Generated Field Types
@@ -448,6 +722,26 @@ async function main(): Promise<void> {
     tables.forEach((t) => {
       console.log(`   - ${t.tableName} (${t.columns.length} columns)`);
     });
+
+    // Introspect foreign key relationships
+    const foreignKeys = await introspectForeignKeys(introspectionConfig.schema);
+    processRelationships(tables, foreignKeys);
+
+    // Log relationships found
+    const totalRelationships = tables.reduce(
+      (sum, t) => sum + t.relationships.length,
+      0
+    );
+    if (totalRelationships > 0) {
+      console.log(`\n🔗 Found ${totalRelationships} relationships:`);
+      tables.forEach((t) => {
+        t.relationships.forEach((r) => {
+          console.log(
+            `   - ${t.tableName}.${r.name} (${r.type} ${r.targetInterface})`
+          );
+        });
+      });
+    }
 
     // Generate TypeScript code
     console.log("\n🔨 Generating TypeScript interfaces...");
