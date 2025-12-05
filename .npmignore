@@ -1,0 +1,29 @@
+# Source files (we ship compiled dist/)
+src/
+
+# Tests
+tests/
+coverage/
+jest.config.js
+
+# Environment
+.env
+.env.example
+
+# Database files
+db/
+migrations/
+generated/
+
+# Config
+tsconfig.json
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+*.log
+.DS_Store
+node_modules/
