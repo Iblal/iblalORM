@@ -10,6 +10,7 @@
 
 import { getDbAdapter } from "../db/DbAdapter";
 import { QueryBuilder } from "./QueryBuilder";
+import { ModelRelationMeta } from "./RelationLoader";
 
 /**
  * Convert camelCase to snake_case for SQL
@@ -19,18 +20,63 @@ function camelToSnake(str: string): string {
 }
 
 /**
- * Type for insertable data - excludes auto-generated fields
+ * Helper type: Get keys where value extends a type
  */
-export type InsertData<TModel, TAutoFields extends keyof TModel> = Omit<
-  TModel,
-  TAutoFields
->;
+type KeysWhereValueExtends<T, V> = {
+  [K in keyof T]: V extends T[K] ? K : never;
+}[keyof T];
+
+/**
+ * Helper type: Get keys where value does NOT extend a type
+ */
+type KeysWhereValueNotExtends<T, V> = {
+  [K in keyof T]: V extends T[K] ? never : K;
+}[keyof T];
+
+/**
+ * Helper type: Get keys of nullable properties (those that accept null)
+ */
+type NullableKeys<T> = KeysWhereValueExtends<T, null>;
+
+/**
+ * Helper type: Get keys of non-nullable properties
+ */
+type RequiredKeys<T> = KeysWhereValueNotExtends<T, null>;
+
+/**
+ * Helper type: Exclude relationship properties (those ending with ?)
+ * Relationships are defined as optional in the interface
+ */
+type DataKeys<T> = {
+  [K in keyof T]: T[K] extends (infer U)[] | undefined
+    ? U extends object
+      ? never // Array relationships
+      : K
+    : T[K] extends object | undefined
+    ? never // Object relationships
+    : K;
+}[keyof T];
+
+/**
+ * Type for insertable data - excludes auto-generated fields
+ * Makes nullable fields optional, requires non-nullable fields
+ */
+export type InsertData<TModel, TAutoFields extends keyof TModel> =
+  // Required non-nullable fields (excluding auto-fields)
+  Pick<TModel, Exclude<RequiredKeys<TModel> & DataKeys<TModel>, TAutoFields>> &
+    // Optional nullable fields (excluding auto-fields)
+    Partial<
+      Pick<
+        TModel,
+        Exclude<NullableKeys<TModel> & DataKeys<TModel>, TAutoFields>
+      >
+    >;
 
 /**
  * Type for updatable data - all fields optional, excludes auto-generated
  */
 export type UpdateData<TModel, TAutoFields extends keyof TModel> = Partial<
-  Omit<TModel, TAutoFields>
+  Pick<TModel, Exclude<DataKeys<TModel>, TAutoFields>>
 >;
 
 /**
@@ -45,15 +91,30 @@ export class Table<
   TAutoFields extends keyof TModel = never
 > {
   private tableName: string;
+  private modelName: string;
   private autoFields: Set<string>;
+  private relationMeta: ModelRelationMeta;
 
   constructor(
     tableName: string,
-    autoFields: Array<keyof TModel & string> = []
+    autoFields: Array<keyof TModel & string> = [],
+    modelName?: string,
+    relationMeta?: ModelRelationMeta
   ) {
     this.tableName = tableName;
+    this.modelName = modelName || "";
+    this.relationMeta = relationMeta || {};
     // Default auto fields + custom ones
     this.autoFields = new Set(["id", "createdAt", "updatedAt", ...autoFields]);
+  }
+
+  /**
+   * Set relationship metadata (for internal use or post-construction setup)
+   */
+  setRelationMeta(modelName: string, meta: ModelRelationMeta): this {
+    this.modelName = modelName;
+    this.relationMeta = meta;
+    return this;
   }
 
   // ==========================================================================
@@ -78,7 +139,11 @@ export class Table<
   select<K extends keyof TModel & string>(
     ...columns: K[] | ["*"]
   ): QueryBuilder<TModel, K> | QueryBuilder<TModel, keyof TModel> {
-    const builder = new QueryBuilder<TModel>(this.tableName);
+    const builder = new QueryBuilder<TModel>(
+      this.tableName,
+      this.modelName,
+      this.relationMeta
+    );
 
     if (columns.length === 1 && columns[0] === "*") {
       return builder.select("*");
@@ -94,14 +159,22 @@ export class Table<
     column: K,
     value: TModel[K]
   ): QueryBuilder<TModel, keyof TModel> {
-    return new QueryBuilder<TModel>(this.tableName).where(column, value);
+    return new QueryBuilder<TModel>(
+      this.tableName,
+      this.modelName,
+      this.relationMeta
+    ).where(column, value);
   }
 
   /**
    * Find a record by ID
    */
   async findById(id: number | string): Promise<TModel | null> {
-    const builder = new QueryBuilder<TModel>(this.tableName);
+    const builder = new QueryBuilder<TModel>(
+      this.tableName,
+      this.modelName,
+      this.relationMeta
+    );
     return builder
       .where(
         "id" as keyof TModel & string,
@@ -114,7 +187,11 @@ export class Table<
    * Get all records
    */
   async findAll(): Promise<TModel[]> {
-    const builder = new QueryBuilder<TModel>(this.tableName);
+    const builder = new QueryBuilder<TModel>(
+      this.tableName,
+      this.modelName,
+      this.relationMeta
+    );
     return builder.select("*").exec() as Promise<TModel[]>;
   }
 
