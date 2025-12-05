@@ -8,6 +8,11 @@ IblalORM is a TypeScript ORM similar to other ORMs like Prisma and Entity Framew
 
 - **Automated Type Generation**: Generate TypeScript interfaces directly from your database schema
 - **Type-Safe Queries**: Full TypeScript support with auto-generated types
+- **Fluent Query Builder**: Chainable API with `.select()`, `.where()`, `.orderBy()`, `.limit()`
+- **Type Projection**: `Pick<TModel, TSelectKeys>` ensures only selected columns are returned
+- **Relationship Loading**: Eager loading with `.include()` and type-safe relationship traversal
+- **Transaction Support**: Automatic COMMIT/ROLLBACK with `transaction()` wrapper
+- **Migration System**: Create, run, and track database migrations
 - **Connection Pooling**: Efficient database connections using `pg` driver's Pool
 - **SQL Injection Prevention**: All queries use parameterized execution
 - **Snake to Camel Case**: Automatic conversion of SQL naming conventions to TypeScript conventions
@@ -28,14 +33,14 @@ npm install
 
 ### 2. Configure Database Connection
 
-Edit `src/config/db.config.ts` or set environment variables:
+Create a `.env` file or set environment variables:
 
 ```bash
-export DB_HOST=localhost
-export DB_PORT=5432
-export DB_NAME=iblal_orm_db
-export DB_USER=postgres
-export DB_PASSWORD=your_password
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=iblal_orm_db
+DB_USER=postgres
+DB_PASSWORD=your_password
 ```
 
 ### 3. Create the Database and Tables
@@ -54,7 +59,120 @@ psql -h localhost -U postgres -d iblal_orm_db -f db/schema.sql
 npm run introspect
 ```
 
-This will generate TypeScript interfaces in `generated/models.ts`.
+This generates TypeScript interfaces and a database client in `generated/`.
+
+## 💻 Usage Examples
+
+### Basic Queries
+
+```typescript
+import { db } from "./generated/client";
+
+// Select all fields
+const users = await db.user.select("*").exec();
+
+// Select specific columns (type-safe projection)
+const emails = await db.user.select("id", "email").exec();
+// emails[0].email ✅ works
+// emails[0].firstName ❌ TypeScript error - not selected
+
+// WHERE clauses
+const activeUsers = await db.user
+  .select("*")
+  .where("isActive", true)
+  .where("role", "admin")
+  .exec();
+
+// Operators
+const recentPosts = await db.post
+  .select("*")
+  .where("viewCount", ">", 100)
+  .orderBy("createdAt", "DESC")
+  .limit(10)
+  .exec();
+```
+
+### Relationship Loading
+
+```typescript
+// Load posts with author (belongsTo)
+const posts = await db.post
+  .select("*")
+  .include("user") // Eager load author
+  .exec();
+
+// TypeScript knows user is loaded (not undefined)
+posts.forEach((post) => {
+  console.log(`${post.title} by ${post.user.email}`);
+});
+
+// Load users with their posts (hasMany)
+const users = await db.user.select("*").include("posts").exec();
+
+users.forEach((user) => {
+  console.log(`${user.displayName} has ${user.posts.length} posts`);
+});
+```
+
+### Insert & Update
+
+```typescript
+// Insert - auto-generated fields (id, createdAt, updatedAt) excluded
+const newUser = await db.user.insert({
+  email: "new@example.com",
+  passwordHash: "hashed",
+  firstName: "John",
+  lastName: "Doe",
+});
+
+// Update with type-safe builder
+await db.user
+  .update()
+  .set({ isActive: true, role: "admin" })
+  .where("id", newUser.id)
+  .exec();
+
+// Delete
+await db.post.delete().where("id", postId).exec();
+```
+
+### Transactions
+
+```typescript
+import { transaction } from "./src/transactions/TransactionManager";
+
+// Automatic COMMIT on success, ROLLBACK on error
+const result = await transaction(async (trx) => {
+  // Insert user
+  const userResult = await trx.query(
+    `INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *`,
+    ["test@example.com", "hash123"]
+  );
+
+  // Insert related profile
+  await trx.query(`INSERT INTO profiles (user_id, bio) VALUES ($1, $2)`, [
+    userResult.rows[0].id,
+    "My bio",
+  ]);
+
+  return userResult.rows[0];
+});
+```
+
+### Migrations
+
+```bash
+# Create a new migration
+npm run migrate:create add_categories_table
+
+# Run pending migrations
+npm run migrate:run
+
+# Check migration status
+npm run migrate:status
+```
+
+Migration files are stored in `migrations/` and tracked in `_iblal_migrations` table.
 
 ## 📁 Project Structure
 
@@ -62,19 +180,41 @@ This will generate TypeScript interfaces in `generated/models.ts`.
 iblalORM/
 ├── src/
 │   ├── config/
-│   │   └── db.config.ts      # Database configuration & type mappings
+│   │   └── db.config.ts          # Database configuration & type mappings
 │   ├── db/
-│   │   └── DbAdapter.ts      # Database connection pool adapter
+│   │   └── DbAdapter.ts          # Database connection pool adapter
+│   ├── query/
+│   │   ├── QueryBuilder.ts       # Fluent query builder with generics
+│   │   ├── Table.ts              # CRUD operations per table
+│   │   └── RelationLoader.ts     # Eager loading for relationships
+│   ├── migrations/
+│   │   └── MigrationManager.ts   # Migration tracking & execution
+│   ├── transactions/
+│   │   └── TransactionManager.ts # Transaction wrapper with auto COMMIT/ROLLBACK
 │   └── cli/
-│       └── introspect.ts     # CLI for schema introspection
+│       ├── introspect.ts         # Schema introspection & code generation
+│       └── migrate.ts            # Migration CLI commands
 ├── db/
-│   └── schema.sql            # Sample database schema
+│   └── schema.sql                # Sample database schema
+├── migrations/                   # Migration SQL files
 ├── generated/
-│   └── models.ts             # Auto-generated TypeScript models
+│   ├── models.ts                 # Auto-generated TypeScript interfaces
+│   └── client.ts                 # Auto-generated database client
 ├── package.json
 ├── tsconfig.json
 └── README.md
 ```
+
+## 🛠️ Available Scripts
+
+| Script                   | Description                                     |
+| ------------------------ | ----------------------------------------------- |
+| `npm run introspect`     | Generate TypeScript models from database schema |
+| `npm run migrate:create` | Create a new migration file                     |
+| `npm run migrate:run`    | Run pending migrations                          |
+| `npm run migrate:status` | Show migration status                           |
+| `npm run build`          | Compile TypeScript to JavaScript                |
+| `npm run clean`          | Remove generated files and build artifacts      |
 
 ## 🔧 Configuration
 
@@ -179,10 +319,11 @@ The CLI tool:
 
 ## 🗺️ Roadmap
 
-- [ ] **Phase 2**: Query Builder with type-safe WHERE clauses
-- [ ] **Phase 3**: Relationship mapping (1:1, 1:N, N:N)
-- [ ] **Phase 4**: Migration system
-- [ ] **Phase 5**: Advanced features (hooks, soft deletes, etc.)
+- [x] **Phase 1**: Schema introspection & type generation
+- [x] **Phase 2**: Query Builder with fluent API & type projection
+- [x] **Phase 3**: Transactions, migrations, and relationship loading
+- [ ] **Phase 4**: Advanced features (hooks, soft deletes, caching)
+- [ ] **Phase 5**: CLI enhancements & documentation
 
 ## 📄 License
 
