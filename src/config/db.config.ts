@@ -7,6 +7,10 @@
  */
 
 import { PoolConfig } from "pg";
+import * as dotenv from "dotenv";
+
+// Load environment variables from .env file
+dotenv.config();
 
 /**
  * PostgreSQL connection configuration
@@ -16,8 +20,8 @@ export const dbConfig: PoolConfig = {
   host: process.env.DB_HOST || "localhost",
   port: parseInt(process.env.DB_PORT || "5432", 10),
   database: process.env.DB_NAME || "iblal_orm_db",
-  user: process.env.DB_USER || "postgres",
-  password: process.env.DB_PASSWORD || "postgres",
+  user: process.env.DB_USER || "iblal",
+  password: process.env.DB_PASSWORD || "",
 
   // Connection pool settings
   max: 10, // Maximum number of clients in the pool
