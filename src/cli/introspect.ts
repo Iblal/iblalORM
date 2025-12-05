@@ -1,0 +1,319 @@
+#!/usr/bin/env ts-node
+/**
+ * IblalORM CLI - Schema Introspection & Type Generation
+ *
+ * This CLI tool:
+ * 1. Connects to the PostgreSQL database
+ * 2. Introspects the schema by reading information_schema.columns
+ * 3. Generates TypeScript interfaces from the database tables
+ * 4. Outputs the generated types to generated/models.ts
+ */
+
+import * as fs from "fs";
+import * as path from "path";
+import { getDbAdapter } from "../db/DbAdapter";
+import { getTsType, introspectionConfig } from "../config/db.config";
+
+/**
+ * Column metadata from the database schema
+ */
+interface ColumnInfo {
+  table_name: string;
+  column_name: string;
+  data_type: string;
+  is_nullable: string;
+  column_default: string | null;
+  ordinal_position: number;
+}
+
+/**
+ * Parsed table structure for code generation
+ */
+interface TableStructure {
+  tableName: string;
+  columns: {
+    columnName: string;
+    tsPropertyName: string;
+    sqlType: string;
+    tsType: string;
+    isNullable: boolean;
+    hasDefault: boolean;
+  }[];
+}
+
+/**
+ * Convert snake_case to camelCase
+ *
+ * @param str - The snake_case string to convert
+ * @returns The camelCase version of the string
+ *
+ * @example
+ * snakeToCamel('first_name') // 'firstName'
+ * snakeToCamel('user_id') // 'userId'
+ */
+function snakeToCamel(str: string): string {
+  return str.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+/**
+ * Convert snake_case to PascalCase (for interface names)
+ *
+ * @param str - The snake_case string to convert
+ * @returns The PascalCase version of the string
+ *
+ * @example
+ * snakeToPascal('users') // 'Users'
+ * snakeToPascal('blog_posts') // 'BlogPosts'
+ */
+function snakeToPascal(str: string): string {
+  const camel = snakeToCamel(str);
+  return camel.charAt(0).toUpperCase() + camel.slice(1);
+}
+
+/**
+ * Singularize a table name for interface naming
+ * Simple implementation - handles common cases
+ *
+ * @param name - The plural table name
+ * @returns The singular form
+ */
+function singularize(name: string): string {
+  if (name.endsWith("ies")) {
+    return name.slice(0, -3) + "y";
+  }
+  if (
+    name.endsWith("ses") ||
+    name.endsWith("xes") ||
+    name.endsWith("ches") ||
+    name.endsWith("shes")
+  ) {
+    return name.slice(0, -2);
+  }
+  if (name.endsWith("s") && !name.endsWith("ss")) {
+    return name.slice(0, -1);
+  }
+  return name;
+}
+
+/**
+ * SQL query to introspect the database schema
+ * Reads from information_schema.columns to get table and column metadata
+ */
+const INTROSPECTION_QUERY = `
+  SELECT 
+    table_name,
+    column_name,
+    data_type,
+    is_nullable,
+    column_default,
+    ordinal_position
+  FROM 
+    information_schema.columns
+  WHERE 
+    table_schema = $1
+    AND table_name NOT LIKE 'pg_%'
+    AND table_name NOT LIKE 'sql_%'
+  ORDER BY 
+    table_name, 
+    ordinal_position;
+`;
+
+/**
+ * Fetch schema metadata from the database
+ */
+async function introspectSchema(schema: string): Promise<ColumnInfo[]> {
+  const adapter = getDbAdapter();
+
+  console.log(`🔍 Introspecting schema: ${schema}`);
+
+  const result = await adapter.query<ColumnInfo>(INTROSPECTION_QUERY, [schema]);
+
+  console.log(`   Found ${result.rows.length} columns across tables`);
+
+  return result.rows;
+}
+
+/**
+ * Group columns by table and transform to TypeScript structure
+ */
+function processSchemaData(columns: ColumnInfo[]): TableStructure[] {
+  const tableMap = new Map<string, TableStructure>();
+
+  for (const col of columns) {
+    if (!tableMap.has(col.table_name)) {
+      tableMap.set(col.table_name, {
+        tableName: col.table_name,
+        columns: [],
+      });
+    }
+
+    const table = tableMap.get(col.table_name)!;
+    table.columns.push({
+      columnName: col.column_name,
+      tsPropertyName: snakeToCamel(col.column_name),
+      sqlType: col.data_type,
+      tsType: getTsType(col.data_type),
+      isNullable: col.is_nullable === "YES",
+      hasDefault: col.column_default !== null,
+    });
+  }
+
+  return Array.from(tableMap.values());
+}
+
+/**
+ * Generate TypeScript interface code from table structure
+ */
+function generateInterface(table: TableStructure): string {
+  const interfaceName = snakeToPascal(singularize(table.tableName));
+
+  const properties = table.columns
+    .map((col) => {
+      const nullable = col.isNullable ? " | null" : "";
+      const comment = `  /** SQL: ${col.sqlType}${
+        col.isNullable ? " (nullable)" : ""
+      }${col.hasDefault ? " (has default)" : ""} */`;
+      return `${comment}\n  ${col.tsPropertyName}: ${col.tsType}${nullable};`;
+    })
+    .join("\n");
+
+  return `/**
+ * Generated interface for table: ${table.tableName}
+ * 
+ * @generated This file is auto-generated. Do not edit manually.
+ */
+export interface ${interfaceName} {
+${properties}
+}`;
+}
+
+/**
+ * Generate the complete models.ts file content
+ */
+function generateModelsFile(tables: TableStructure[]): string {
+  const header = `/**
+ * IblalORM Generated Models
+ * 
+ * This file is auto-generated by the introspect CLI command.
+ * Do not edit this file manually - your changes will be overwritten.
+ * 
+ * Generated at: ${new Date().toISOString()}
+ * Schema: ${introspectionConfig.schema}
+ * Tables: ${tables.length}
+ */
+
+`;
+
+  const interfaces = tables.map(generateInterface).join("\n\n");
+
+  // Generate a type that maps table names to their interfaces
+  const tableNameMapping = tables
+    .map((t) => `  ${t.tableName}: ${snakeToPascal(singularize(t.tableName))};`)
+    .join("\n");
+
+  const tableMapType = `
+/**
+ * Type mapping from table names to their interfaces
+ */
+export interface TableMap {
+${tableNameMapping}
+}
+
+/**
+ * Union type of all table names
+ */
+export type TableName = keyof TableMap;
+
+/**
+ * Get the interface type for a given table name
+ */
+export type TableType<T extends TableName> = TableMap[T];
+`;
+
+  return header + interfaces + tableMapType;
+}
+
+/**
+ * Ensure the output directory exists
+ */
+function ensureOutputDirectory(outputPath: string): void {
+  const dir = path.dirname(outputPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+    console.log(`📁 Created directory: ${dir}`);
+  }
+}
+
+/**
+ * Write the generated code to file
+ */
+function writeGeneratedFile(content: string, outputPath: string): void {
+  ensureOutputDirectory(outputPath);
+  fs.writeFileSync(outputPath, content, "utf-8");
+  console.log(`✅ Generated: ${outputPath}`);
+}
+
+/**
+ * Main CLI entry point
+ */
+async function main(): Promise<void> {
+  console.log("\n🚀 IblalORM Schema Introspection\n");
+  console.log("================================\n");
+
+  const adapter = getDbAdapter();
+
+  try {
+    // Test database connection
+    console.log("📡 Testing database connection...");
+    await adapter.testConnection();
+    console.log("   Connection successful!\n");
+
+    // Introspect the schema
+    const columns = await introspectSchema(introspectionConfig.schema);
+
+    if (columns.length === 0) {
+      console.warn(
+        "\n⚠️  No tables found in the schema. Make sure your database has tables."
+      );
+      console.log(
+        "   You can run the schema.sql file to create sample tables.\n"
+      );
+      return;
+    }
+
+    // Process the schema data
+    const tables = processSchemaData(columns);
+    console.log(`\n📊 Processing ${tables.length} table(s):`);
+    tables.forEach((t) => {
+      console.log(`   - ${t.tableName} (${t.columns.length} columns)`);
+    });
+
+    // Generate TypeScript code
+    console.log("\n🔨 Generating TypeScript interfaces...");
+    const generatedCode = generateModelsFile(tables);
+
+    // Write to file
+    const outputPath = path.join(
+      process.cwd(),
+      introspectionConfig.outputDir,
+      introspectionConfig.outputFile
+    );
+    writeGeneratedFile(generatedCode, outputPath);
+
+    console.log("\n✨ Introspection complete!\n");
+  } catch (error) {
+    console.error("\n❌ Error during introspection:");
+    if (error instanceof Error) {
+      console.error(`   ${error.message}`);
+    } else {
+      console.error("   Unknown error occurred");
+    }
+    process.exit(1);
+  } finally {
+    // Always close the connection pool
+    await adapter.close();
+  }
+}
+
+// Run the CLI
+main();
