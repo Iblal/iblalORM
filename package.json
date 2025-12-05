@@ -10,7 +10,10 @@
     "migrate:create": "ts-node src/cli/migrate.ts create",
     "migrate:run": "ts-node src/cli/migrate.ts run",
     "migrate:status": "ts-node src/cli/migrate.ts status",
-    "clean": "rm -rf dist generated"
+    "clean": "rm -rf dist generated",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
   },
   "keywords": [
     "orm",
@@ -26,8 +29,11 @@
     "pg": "^8.11.3"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@types/node": "^20.10.0",
     "@types/pg": "^8.10.9",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.2"
   },
