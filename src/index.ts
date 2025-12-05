@@ -8,6 +8,10 @@
 // Database Adapter
 export { DbAdapter, getDbAdapter } from "./db/DbAdapter";
 
+// Query Builder
+export { QueryBuilder } from "./query/QueryBuilder";
+export { Table, InsertData, UpdateData } from "./query/Table";
+
 // Configuration
 export {
   dbConfig,
