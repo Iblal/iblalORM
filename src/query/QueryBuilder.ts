@@ -10,6 +10,11 @@
 
 import { QueryResult } from "pg";
 import { getDbAdapter } from "../db/DbAdapter";
+import {
+  RelationLoader,
+  ModelRelationMeta,
+  WithLoadedRelations,
+} from "./RelationLoader";
 
 // ============================================================================
 // Type Utilities
@@ -73,24 +78,76 @@ function camelToSnake(str: string): string {
  *
  * @template TModel - The full model interface
  * @template TSelectKeys - Union of selected column keys (defaults to keyof TModel)
+ * @template TIncluded - Union of included relationship keys
  */
 export class QueryBuilder<
   TModel extends object,
-  TSelectKeys extends keyof TModel = keyof TModel
+  TSelectKeys extends keyof TModel = keyof TModel,
+  TIncluded extends keyof TModel = never
 > {
   private tableName: string;
+  private modelName: string = "";
   private selectedColumns: Array<keyof TModel & string> | "*" = "*";
   private whereConditions: WhereCondition[] = [];
   private orderByClauses: OrderByClause[] = [];
   private limitCount: number | null = null;
   private offsetCount: number | null = null;
+  private includedRelations: string[] = [];
+  private relationMeta: ModelRelationMeta = {};
 
   /**
    * Create a new QueryBuilder instance
    * @param tableName - The database table name
+   * @param modelName - The model name (for relationship loading)
+   * @param relationMeta - Relationship metadata for this model
    */
-  constructor(tableName: string) {
+  constructor(
+    tableName: string,
+    modelName?: string,
+    relationMeta?: ModelRelationMeta
+  ) {
     this.tableName = tableName;
+    this.modelName = modelName || "";
+    this.relationMeta = relationMeta || {};
+  }
+
+  /**
+   * Set relationship metadata (for internal use)
+   */
+  setRelationMeta(modelName: string, meta: ModelRelationMeta): this {
+    this.modelName = modelName;
+    this.relationMeta = meta;
+    return this;
+  }
+
+  // ==========================================================================
+  // INCLUDE - Eager Loading Relationships
+  // ==========================================================================
+
+  /**
+   * Include a relationship in the query results
+   *
+   * This triggers eager loading of the specified relationship.
+   * The return type is transformed to make the relationship required.
+   *
+   * @template R - The relationship key to include
+   * @param relation - Name of the relationship to load
+   * @returns Query builder with updated return type
+   *
+   * @example
+   * // Load posts with author
+   * const posts = await db.post
+   *   .select('*')
+   *   .include('author')
+   *   .exec();
+   * // posts[0].author is now required (not undefined)
+   */
+  include<R extends keyof TModel & string>(
+    relation: R
+  ): QueryBuilder<TModel, TSelectKeys, TIncluded | R> {
+    const builder = this.clone<TSelectKeys, TIncluded | R>();
+    builder.includedRelations.push(relation);
+    return builder;
   }
 
   // ==========================================================================
@@ -101,7 +158,7 @@ export class QueryBuilder<
    * Select all columns
    * Returns builder with all model keys selected
    */
-  select(columns: "*"): QueryBuilder<TModel, keyof TModel>;
+  select(columns: "*"): QueryBuilder<TModel, keyof TModel, TIncluded>;
 
   /**
    * Select specific columns with type projection
@@ -112,16 +169,18 @@ export class QueryBuilder<
    */
   select<K extends keyof TModel & string>(
     ...columns: K[]
-  ): QueryBuilder<TModel, K>;
+  ): QueryBuilder<TModel, K, TIncluded>;
 
   /**
    * Implementation of select overloads
    */
   select<K extends keyof TModel & string>(
     ...columns: K[] | ["*"]
-  ): QueryBuilder<TModel, K> | QueryBuilder<TModel, keyof TModel> {
+  ):
+    | QueryBuilder<TModel, K, TIncluded>
+    | QueryBuilder<TModel, keyof TModel, TIncluded> {
     // Create new instance to maintain immutability
-    const builder = this.clone<K>();
+    const builder = this.clone<K, TIncluded>();
 
     if (columns.length === 1 && columns[0] === "*") {
       builder.selectedColumns = "*";
@@ -129,7 +188,7 @@ export class QueryBuilder<
       builder.selectedColumns = columns as Array<keyof TModel & string>;
     }
 
-    return builder as QueryBuilder<TModel, K>;
+    return builder as QueryBuilder<TModel, K, TIncluded>;
   }
 
   // ==========================================================================
@@ -145,7 +204,7 @@ export class QueryBuilder<
   where<K extends keyof TModel & string>(
     column: K,
     value: TModel[K]
-  ): QueryBuilder<TModel, TSelectKeys>;
+  ): QueryBuilder<TModel, TSelectKeys, TIncluded>;
 
   /**
    * Add a WHERE condition with custom operator
@@ -158,7 +217,7 @@ export class QueryBuilder<
     column: K,
     operator: ComparisonOperator,
     value: TModel[K] | TModel[K][]
-  ): QueryBuilder<TModel, TSelectKeys>;
+  ): QueryBuilder<TModel, TSelectKeys, TIncluded>;
 
   /**
    * Implementation of where overloads
@@ -167,8 +226,8 @@ export class QueryBuilder<
     column: K,
     operatorOrValue: ComparisonOperator | TModel[K],
     value?: TModel[K] | TModel[K][]
-  ): QueryBuilder<TModel, TSelectKeys> {
-    const builder = this.clone<TSelectKeys>();
+  ): QueryBuilder<TModel, TSelectKeys, TIncluded> {
+    const builder = this.clone<TSelectKeys, TIncluded>();
 
     let operator: ComparisonOperator;
     let actualValue: unknown;
@@ -197,8 +256,8 @@ export class QueryBuilder<
    */
   whereNull<K extends keyof TModel & string>(
     column: K
-  ): QueryBuilder<TModel, TSelectKeys> {
-    const builder = this.clone<TSelectKeys>();
+  ): QueryBuilder<TModel, TSelectKeys, TIncluded> {
+    const builder = this.clone<TSelectKeys, TIncluded>();
     builder.whereConditions.push({
       column,
       operator: "IS NULL",
@@ -212,8 +271,8 @@ export class QueryBuilder<
    */
   whereNotNull<K extends keyof TModel & string>(
     column: K
-  ): QueryBuilder<TModel, TSelectKeys> {
-    const builder = this.clone<TSelectKeys>();
+  ): QueryBuilder<TModel, TSelectKeys, TIncluded> {
+    const builder = this.clone<TSelectKeys, TIncluded>();
     builder.whereConditions.push({
       column,
       operator: "IS NOT NULL",
@@ -235,8 +294,8 @@ export class QueryBuilder<
   orderBy<K extends keyof TModel & string>(
     column: K,
     direction: SortDirection = "ASC"
-  ): QueryBuilder<TModel, TSelectKeys> {
-    const builder = this.clone<TSelectKeys>();
+  ): QueryBuilder<TModel, TSelectKeys, TIncluded> {
+    const builder = this.clone<TSelectKeys, TIncluded>();
     builder.orderByClauses.push({ column, direction });
     return builder;
   }
@@ -248,8 +307,8 @@ export class QueryBuilder<
   /**
    * Limit the number of results
    */
-  limit(count: number): QueryBuilder<TModel, TSelectKeys> {
-    const builder = this.clone<TSelectKeys>();
+  limit(count: number): QueryBuilder<TModel, TSelectKeys, TIncluded> {
+    const builder = this.clone<TSelectKeys, TIncluded>();
     builder.limitCount = count;
     return builder;
   }
@@ -257,8 +316,8 @@ export class QueryBuilder<
   /**
    * Skip a number of results
    */
-  offset(count: number): QueryBuilder<TModel, TSelectKeys> {
-    const builder = this.clone<TSelectKeys>();
+  offset(count: number): QueryBuilder<TModel, TSelectKeys, TIncluded> {
+    const builder = this.clone<TSelectKeys, TIncluded>();
     builder.offsetCount = count;
     return builder;
   }
@@ -354,27 +413,55 @@ export class QueryBuilder<
   // ==========================================================================
 
   /**
+   * Result type that includes loaded relationships
+   * Uses conditional type to make included relations required
+   */
+  private ResultType!: Pick<TModel, TSelectKeys> &
+    Required<Pick<TModel, TIncluded>>;
+
+  /**
    * Execute the query and return results
    *
-   * The return type uses Pick<TModel, TSelectKeys> to ensure
-   * the returned objects only contain the selected columns.
+   * The return type uses Pick<TModel, TSelectKeys> for the base fields
+   * and adds Required<Pick<TModel, TIncluded>> for loaded relationships.
    *
-   * @returns Promise resolving to array of projected model objects
+   * @returns Promise resolving to array of projected model objects with relations
    */
-  async exec(): Promise<Array<Pick<TModel, TSelectKeys>>> {
+  async exec(): Promise<
+    Array<Pick<TModel, TSelectKeys> & Required<Pick<TModel, TIncluded>>>
+  > {
     const adapter = getDbAdapter();
     const { sql, params } = this.buildSelectQuery();
 
     const result = await adapter.query(sql, params);
 
     // Transform snake_case results to camelCase
-    return result.rows.map((row) => this.transformRow(row));
+    let rows = result.rows.map((row) => this.transformRow(row)) as TModel[];
+
+    // Load relationships if any were included
+    if (
+      this.includedRelations.length > 0 &&
+      Object.keys(this.relationMeta).length > 0
+    ) {
+      const loader = new RelationLoader<TModel>(
+        this.modelName,
+        this.tableName,
+        this.relationMeta
+      );
+      rows = await loader.loadRelations(rows, this.includedRelations);
+    }
+
+    return rows as Array<
+      Pick<TModel, TSelectKeys> & Required<Pick<TModel, TIncluded>>
+    >;
   }
 
   /**
    * Execute and return the first result or null
    */
-  async first(): Promise<Pick<TModel, TSelectKeys> | null> {
+  async first(): Promise<
+    (Pick<TModel, TSelectKeys> & Required<Pick<TModel, TIncluded>>) | null
+  > {
     const results = await this.limit(1).exec();
     return results[0] || null;
   }
@@ -401,16 +488,21 @@ export class QueryBuilder<
   /**
    * Clone the builder for immutable operations
    */
-  private clone<NewSelectKeys extends keyof TModel>(): QueryBuilder<
-    TModel,
-    NewSelectKeys
-  > {
-    const builder = new QueryBuilder<TModel, NewSelectKeys>(this.tableName);
+  private clone<
+    NewSelectKeys extends keyof TModel,
+    NewIncluded extends keyof TModel = TIncluded
+  >(): QueryBuilder<TModel, NewSelectKeys, NewIncluded> {
+    const builder = new QueryBuilder<TModel, NewSelectKeys, NewIncluded>(
+      this.tableName,
+      this.modelName,
+      this.relationMeta
+    );
     builder.selectedColumns = this.selectedColumns;
     builder.whereConditions = [...this.whereConditions];
     builder.orderByClauses = [...this.orderByClauses];
     builder.limitCount = this.limitCount;
     builder.offsetCount = this.offsetCount;
+    builder.includedRelations = [...this.includedRelations];
     return builder;
   }
 
