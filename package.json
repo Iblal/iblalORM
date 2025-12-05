@@ -1,12 +1,15 @@
 {
   "name": "iblal-orm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Type-Safe TypeScript ORM with Automated Type Generation from Database Schema",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
     "introspect": "ts-node src/cli/introspect.ts",
+    "migrate:create": "ts-node src/cli/migrate.ts create",
+    "migrate:run": "ts-node src/cli/migrate.ts run",
+    "migrate:status": "ts-node src/cli/migrate.ts status",
     "clean": "rm -rf dist generated"
   },
   "keywords": [
